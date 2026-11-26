@@ -1,0 +1,34 @@
+# Python environment
+.venv/
+__pycache__/
+*.pyc
+
+# Third-party SDK
+SDK/
+
+# Private training resources
+models/
+dataset/
+checkpoints/
+
+# Model assets
+*.moc3
+*.cmo3
+*.psd
+*.can3
+*.pt
+*.pth
+*.safetensors
+*.npz
+
+# Generated files
+*.log
+synthetic_eye_viewer.html
+
+# Secrets
+.env
+.env.*
+# SDK archives
+*.zip
+*.rar
+*.7z
