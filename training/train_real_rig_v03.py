@@ -18,6 +18,7 @@ from train_real_rig_v01 import ROOT, PARAMS, load_record, mean_by, target
 from train_real_rig_v02 import prepare, balanced_mean, report
 
 SIZE = 48
+CHECK_STOP = lambda: None
 
 def local_path(base, rel, root):
     p = (base / rel).resolve()
@@ -67,6 +68,7 @@ def mesh_patches(path, model_root):
         raise ValueError(f'Invalid texture mapping: {path.name}')
     patches=[]
     for i,(a,b) in enumerate(zip(off[:-1],off[1:])):
+        CHECK_STOP()
         tr=tri[(tri[:,0]>=a)&(tri[:,0]<b)]-a
         if np.any(tr<0) or np.any(tr>=b-a): raise ValueError('Invalid local triangle')
         patches.append(crop_mesh(textures[int(tx[i])],uv[a:b],tr))
@@ -85,6 +87,7 @@ def sheet(patches, ids, out):
 def load_visual(data, model_root, device, audit_dir):
     groups={}; records=[]
     for p in sorted(data.rglob('*.npz')):
+        CHECK_STOP()
         if p.parent.parent.resolve()!=data.resolve(): raise ValueError(f'Unexpected dataset layout: {p}')
         with np.load(p,allow_pickle=False) as z:
             # Compare rest-input metadata across parameter sweeps, not target displacements.

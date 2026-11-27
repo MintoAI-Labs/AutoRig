@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="vi">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MintoAI · So sánh rig</title>
+<style>
+:root{color-scheme:dark;--bg:#0e141a;--panel:#17212b;--line:#324452;--text:#e5edf0;--muted:#aabdc9;--green:#a1e2bd}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,sans-serif}
+main{max-width:1500px;margin:auto;padding:clamp(12px,3vw,36px)}h1{font-size:clamp(25px,4vw,39px);margin:0 0 4px}
+p{margin:8px 0;color:var(--muted)}.bar,.panes{display:grid;gap:12px;margin-top:14px}
+.bar{grid-template-columns:minmax(190px,2fr) auto minmax(120px,3fr) auto;align-items:end}
+.panes{grid-template-columns:repeat(3,minmax(0,1fr))}article,.diagnostics{background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+h2{font-size:15px;margin:0;padding:9px 12px}article:last-child h2{color:var(--green)}
+canvas{display:block;width:100%;aspect-ratio:1;background:#111a23}label{display:grid;gap:4px;color:var(--muted)}
+select,button{min-height:40px;border:1px solid var(--line);border-radius:7px;background:#202e3a;color:var(--text);padding:5px 10px;font:inherit}
+button{cursor:pointer}button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid var(--green)}
+input[type=range]{width:100%;accent-color:var(--green);margin:0;min-height:40px}
+.status{min-height:1.5em}.diagnostics{margin-top:14px;overflow:auto}table{border-collapse:collapse;width:100%;text-align:left;font-variant-numeric:tabular-nums}
+th,td{padding:8px 12px;border-top:1px solid var(--line);white-space:nowrap}th{color:var(--muted)}td button{min-height:28px;padding:1px 7px}
+@media(max-width:740px){.bar{grid-template-columns:minmax(0,1fr) auto}.panes{gap:5px}h2{font-size:12px;padding:5px}}
+</style>
+<main>
+<h1>So sánh biến dạng rig</h1>
+<p>Rig gốc từ snapshot, Real Rig best cũ và ứng viên seed 42 bước 50.</p>
+<div class="bar">
+<label>Bộ chấm và control <select id="record"></select></label>
+<button id="play" type="button" aria-pressed="false">Phát</button>
+<label>Pose <input id="pose" type="range" min="0" max="100" step="0.01" value="0"></label>
+<label>Hiển thị <select id="mode"><option value="texture">Texture</option><option value="wire">Wireframe</option></select></label>
+</div>
+<p class="status" id="status" role="status"></p>
+<div class="panes">
+<article><h2>Rig gốc</h2><canvas width="600" height="600" aria-label="Rig gốc"></canvas></article>
+<article><h2>Best cũ</h2><canvas width="600" height="600" aria-label="Best cũ"></canvas></article>
+<article><h2>Ứng viên · seed 42 bước 50</h2><canvas width="600" height="600" aria-label="Ứng viên"></canvas></article>
+</div>
+<section class="diagnostics" aria-label="Sai số theo vùng">
+<h2>Sai số trên pose đang xem</h2>
+<table><thead><tr><th>Vùng</th><th>Best cũ RMS / max</th><th>Ứng viên RMS / max</th><th>Max bộ chấm · best cũ</th><th>Max bộ chấm · ứng viên</th></tr></thead><tbody id="errors"></tbody></table>
+</section>
+<p>Lỗi chia theo scale của control. Vùng chuyển động gồm các đỉnh có dịch chuyển khác 0 trong sweep rig gốc. Nút max nhảy tới pose mẫu có sai số tọa độ lớn nhất trong bộ chấm, tính độc lập cho mỗi checkpoint và mỗi vùng.</p>
+<p>Ba khung dùng cùng camera cố định và tỷ lệ tọa độ snapshot. Phát liên tục bằng nội suy giữa các mẫu; số chấm mô hình lấy tại pose mẫu. Preview texture dùng UV, opacity, renderOrders từ Cubism Core và mask của rig gốc cho cả ba cột, để so sánh riêng hình học. Khâu compositing WebGL có thể khác Cubism Runtime.</p>
+</main>
+<script id="payload" type="application/json">__DATA__</script>
+<script>
+'use strict';
+const data = JSON.parse(document.querySelector('#payload').textContent);
+const select = document.querySelector('#record'), slider = document.querySelector('#pose');
+const play = document.querySelector('#play'), mode = document.querySelector('#mode');
+const status = document.querySelector('#status'), table = document.querySelector('#errors');
+
+async function unpack(encoded, Type) {
+  const bytes = Uint8Array.from(atob(encoded), character => character.charCodeAt(0));
+  return new Type(await new Response(
+    new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer());
+}
+
+const vertex = `#version 300 es
+in vec2 position;
+in vec2 uv;
+uniform vec2 center;
+uniform float scale;
+out vec2 atlasUV;
+void main(){
+  gl_Position=vec4((position-center)*scale,0.,1.);
+  atlasUV=vec2(uv.x,1.-uv.y);
+}`;
+const fragment = `#version 300 es
+precision mediump float;
+in vec2 atlasUV;
+uniform sampler2D atlas;
+uniform sampler2D clipImage;
+uniform vec2 frameSize;
+uniform float alpha;
+uniform int clipping;
+uniform bool wire;
+out vec4 pixel;
+void main(){
+  if(wire){pixel=vec4(.42,.78,.66,.62);return;}
+  vec4 color=texture(atlas,atlasUV);
+  float coverage=1.;
+  if(clipping!=0){
+    coverage=texture(clipImage,gl_FragCoord.xy/frameSize).a;
+    if(clipping==2) coverage=1.-coverage;
+  }
+  float a=color.a*alpha*coverage;
+  pixel=vec4(color.rgb*a,a);
+}`;
+
+const [x0,y0,x1,y1] = data.bounds;
+const center = [(x0+x1)/2,(y0+y1)/2];
+const camera = 1.82/Math.max(x1-x0,y1-y0);
+const normals = [], renderers = [];
+
+function setupGL(canvas, gl) {
+  const program = gl.createProgram();
+  for (const [kind, source] of [[gl.VERTEX_SHADER,vertex],[gl.FRAGMENT_SHADER,fragment]]) {
+    const shader = gl.createShader(kind);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader,gl.COMPILE_STATUS)) throw Error(gl.getShaderInfoLog(shader));
+    gl.attachShader(program, shader);
+    gl.deleteShader(shader);
+  }
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program,gl.LINK_STATUS)) throw Error(gl.getProgramInfoLog(program));
+  gl.useProgram(program);
+  const uniform = Object.fromEntries(['center','scale','atlas','clipImage','frameSize','alpha','clipping','wire']
+    .map(name => [name, gl.getUniformLocation(program,name)]));
+  gl.uniform2fv(uniform.center,center);
+  gl.uniform1f(uniform.scale,camera);
+  gl.uniform1i(uniform.atlas,0);
+  gl.uniform1i(uniform.clipImage,1);
+  gl.uniform2f(uniform.frameSize,canvas.width,canvas.height);
+  gl.enable(gl.BLEND);
+  const positions = gl.createBuffer(), uv = gl.createBuffer();
+  for (const [name,buffer] of [['position',positions],['uv',uv]]) {
+    const at = gl.getAttribLocation(program,name);
+    gl.bindBuffer(gl.ARRAY_BUFFER,buffer);
+    gl.vertexAttribPointer(at,2,gl.FLOAT,false,0,0);
+    gl.enableVertexAttribArray(at);
+  }
+  const triangles = gl.createBuffer(), lines = gl.createBuffer();
+  const mask = gl.createTexture(), frame = gl.createFramebuffer();
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D,mask);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,canvas.width,canvas.height,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,frame);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,mask,0);
+  if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)!==gl.FRAMEBUFFER_COMPLETE) throw Error('Không tạo được mask WebGL');
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+  gl.activeTexture(gl.TEXTURE0);
+  let atlases = [], scene;
+
+  function upload(model) {
+    if (scene===model) return;
+    scene=model;
+    for (const atlas of atlases) gl.deleteTexture(atlas);
+    atlases=model.images.map(image => {
+      const tex=gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D,tex);
+      gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,image);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+      return tex;
+    });
+    gl.bindBuffer(gl.ARRAY_BUFFER,uv);
+    gl.bufferData(gl.ARRAY_BUFFER,model.uv,gl.STATIC_DRAW);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,triangles);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,model.triangles,gl.STATIC_DRAW);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,lines);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,model.lines,gl.STATIC_DRAW);
+  }
+
+  function drawMesh(mesh, alpha, blend) {
+    gl.bindTexture(gl.TEXTURE_2D,atlases[mesh.atlas]);
+    gl.uniform1f(uniform.alpha,alpha);
+    if (blend && (mesh.flags&1)) gl.blendFuncSeparate(gl.ONE,gl.ONE,gl.ZERO,gl.ONE);
+    else if (blend && (mesh.flags&2)) gl.blendFuncSeparate(gl.DST_COLOR,gl.ONE_MINUS_SRC_ALPHA,gl.ZERO,gl.ONE);
+    else gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA);
+    gl.drawElements(gl.TRIANGLES,mesh.count,gl.UNSIGNED_INT,mesh.first*4);
+  }
+  return {
+    textured:true, upload,
+    draw(points, layerOrder, opacity, wire) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+      gl.viewport(0,0,canvas.width,canvas.height);
+      gl.clearColor(.067,.102,.137,1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.bindBuffer(gl.ARRAY_BUFFER,positions);
+      gl.bufferData(gl.ARRAY_BUFFER,points,gl.DYNAMIC_DRAW);
+      gl.uniform1i(uniform.wire,Number(wire));
+      gl.uniform1i(uniform.clipping,0);
+      if (wire) {
+        gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA);
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,lines);
+        gl.drawElements(gl.LINES,scene.lines.length,gl.UNSIGNED_INT,0);
+        return;
+      }
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,triangles);
+      for(const i of layerOrder){
+        if(opacity[i]<=0) continue;
+        const mesh=scene.meshes[i];
+        gl.uniform1i(uniform.clipping,0);
+        if(mesh.masks.length){
+          gl.activeTexture(gl.TEXTURE1);
+          gl.bindTexture(gl.TEXTURE_2D,null);
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindFramebuffer(gl.FRAMEBUFFER,frame);
+          gl.clearColor(0,0,0,0);
+          gl.clear(gl.COLOR_BUFFER_BIT);
+          for(const source of mesh.masks) drawMesh(scene.meshes[source],1,false);
+          gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+          gl.activeTexture(gl.TEXTURE1);
+          gl.bindTexture(gl.TEXTURE_2D,mask);
+          gl.activeTexture(gl.TEXTURE0);
+          gl.uniform1i(uniform.clipping,mesh.flags&8?2:1);
+        }
+        drawMesh(mesh,opacity[i],true);
+      }
+    }
+  };
+}
+
+function setupWire(canvas){
+  const ctx=canvas.getContext('2d');
+  let scene;
+  return {
+    textured:false,upload(model){scene=model;},
+    draw(points){
+      const size=canvas.width, scale=size*camera/2;
+      ctx.fillStyle='#111a23';ctx.fillRect(0,0,size,size);
+      ctx.strokeStyle='#79c3a8';ctx.lineWidth=.6;ctx.beginPath();
+      for(let i=0;i<scene.lines.length;i+=2){
+        const a=2*scene.lines[i], b=2*scene.lines[i+1];
+        ctx.moveTo(size/2+(points[a]-center[0])*scale,size/2-(points[a+1]-center[1])*scale);
+        ctx.lineTo(size/2+(points[b]-center[0])*scale,size/2-(points[b+1]-center[1])*scale);
+      }
+      ctx.stroke();
+    }
+  };
+}
+
+for (const canvas of document.querySelectorAll('canvas')){
+  const gl=canvas.getContext('webgl2',{alpha:false,antialias:true,premultipliedAlpha:true,preserveDrawingBuffer:true});
+  renderers.push(gl ? setupGL(canvas,gl) : setupWire(canvas));
+}
+const textured=renderers.every(renderer=>renderer.textured);
+if(!textured){mode.value='wire';mode.disabled=true;}
+
+async function loadModel(index){
+  if(!normals[index]) normals[index]=(async()=>{
+    const item=data.models[index];
+    const [rest,uv,triangles,images]=await Promise.all([
+      unpack(item.rest,Float32Array),unpack(item.uv,Float32Array),unpack(item.triangles,Uint32Array),
+      textured ? Promise.all(item.atlases.map(async source => {
+        const image=new Image();image.src=source;await image.decode();return image;
+      })) : []
+    ]);
+    const lines=new Uint32Array(triangles.length*2);
+    for(let i=0;i<triangles.length;i+=3){
+      const [a,b,c]=triangles.subarray(i,i+3);
+      lines.set([a,b,b,c,c,a],i*2);
+    }
+    return {...item,rest,uv,triangles,lines,images};
+  })();
+  return normals[index];
+}
+
+const regionLabels={moving:'Vùng chuyển động',static:'Vùng đứng yên',all:'Toàn bộ'};
+const fields={};
+for(const [key,label] of Object.entries(regionLabels)){
+  const tr=document.createElement('tr');
+  const th=document.createElement('th');th.scope='row';th.textContent=label;tr.append(th);
+  fields[key]=Array.from({length:4},()=>tr.appendChild(document.createElement('td')));
+  table.append(tr);
+}
+
+data.records.forEach((record,index)=>{
+  const option=document.createElement('option');
+  option.value=index;
+  option.textContent=record.scope+' · '+record.source+' · '+record.param;
+  select.append(option);
+});
+
+let current, loading=0, playing=false, last=0, direction=1;
+function pause(){playing=false;play.textContent='Phát';play.setAttribute('aria-pressed','false');}
+function format(value){return value===0?'0':value<.001?value.toExponential(3):value.toFixed(6);}
+function metricsText(total){return total.count?format(Math.sqrt(total.sum/total.count))+' / '+format(total.max):'—';}
+function maxButton(cell, result){
+  cell.replaceChildren();
+  if(!result){cell.textContent='—';return;}
+  const button=document.createElement('button');
+  button.type='button';
+  button.textContent=format(result.max)+' · pose '+(result.pose+1);
+  button.onclick=()=>{pause();slider.value=result.pose;draw();};
+  cell.append(button);
+}
+function draw(){
+  if(!current) return;
+  const {record,model,delta,moving,opacities,orders,points}=current;
+  const n=record.values.length, length=model.rest.length, meshes=model.meshes.length;
+  const frame=Number(slider.value), lo=Math.floor(frame), hi=Math.min(lo+1,n-1), f=frame-lo;
+  const order=Array.from({length:meshes},(_,i)=>i).sort((a,b)=>orders[Math.round(frame)*meshes+a]-orders[Math.round(frame)*meshes+b]);
+  const opacity=Array.from({length:meshes},(_,i)=>opacities[lo*meshes+i]*(1-f)+opacities[hi*meshes+i]*f);
+  const totals=Array.from({length:2},()=>Object.fromEntries(
+    Object.keys(regionLabels).map(key=>[key,{sum:0,count:0,max:0}])));
+  for(let i=0;i<length;i++){
+    const displacement=(column)=>delta[(column*n+lo)*length+i]*(1-f)+delta[(column*n+hi)*length+i]*f;
+    const truth=displacement(0);
+    points[0][i]=model.rest[i]+truth;
+    for(let col=1;col<3;col++){
+      const pred=displacement(col);
+      points[col][i]=model.rest[i]+pred;
+      const error=Math.abs(pred-truth)/record.scale;
+      for(const key of ['all',moving[i>>1]?'moving':'static']){
+        const total=totals[col-1][key];
+        total.sum+=error*error;total.count++;total.max=Math.max(total.max,error);
+      }
+    }
+  }
+  renderers.forEach((renderer,i)=>renderer.draw(points[i],order,opacity,mode.value==='wire'));
+  for(const key of Object.keys(regionLabels)){
+    fields[key][0].textContent=metricsText(totals[0][key]);
+    fields[key][1].textContent=metricsText(totals[1][key]);
+  }
+  const value=record.values[lo]*(1-f)+record.values[hi]*f;
+  const kind=f>1e-6?'nội suy':record.exam.includes(lo)?'pose bộ chấm':'mẫu ngoài bộ chấm';
+  status.textContent='Giá trị '+value.toFixed(4)+' · '+kind+' · '+(f>1e-6?(frame+1).toFixed(2):lo+1)+' / '+n+
+    (!textured?' · WebGL2 không khả dụng, đang dùng wireframe':'');
+}
+
+async function changeRecord(){
+  pause();
+  current=null; const ticket=++loading;
+  status.textContent='Đang nạp mesh và texture…';
+  const record=data.records[Number(select.value)];
+  try {
+    const [model,delta,moving,opacities,orders]=await Promise.all([
+      loadModel(record.model),unpack(record.deltas,Float32Array),unpack(record.moving,Uint8Array),
+      unpack(record.opacity,Float32Array),unpack(record.renderOrder,Int32Array)
+    ]);
+    if(ticket!==loading) return;
+    current={record,model,delta,moving,opacities,orders,
+      points:Array.from({length:3},()=>new Float32Array(model.rest.length))};
+    for(const renderer of renderers) renderer.upload(model);
+    slider.max=record.values.length-1;
+    slider.value=record.errors[1].all.pose;
+    for(const key of Object.keys(regionLabels)){
+      maxButton(fields[key][2],record.errors[0][key]);
+      maxButton(fields[key][3],record.errors[1][key]);
+    }
+    draw();
+  } catch(error) {
+    if(ticket===loading) status.textContent='Không nạp được dữ liệu: '+error.message;
+    console.error(error);
+  }
+}
+function animate(time){
+  if(!playing || !current) return;
+  if(last){
+    let next=Number(slider.value)+direction*Math.min(time-last,80)*Number(slider.max)/2600;
+    if(next>Number(slider.max)){next=Number(slider.max);direction=-1;}
+    if(next<0){next=0;direction=1;}
+    slider.value=next;
+    draw();
+  }
+  last=time;requestAnimationFrame(animate);
+}
+play.onclick=()=>{
+  if(!current) return;
+  if(playing){pause();return;}
+  playing=true;last=0;play.textContent='Tạm dừng';play.setAttribute('aria-pressed','true');
+  requestAnimationFrame(animate);
+};
+select.onchange=changeRecord;
+slider.oninput=()=>{pause();draw();};
+mode.onchange=draw;
+changeRecord();
+</script>
+</html>
